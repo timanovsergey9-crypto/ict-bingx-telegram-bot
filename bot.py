@@ -1,1 +1,1 @@
-See /workspace/artifacts/bot_final.py - content will be synced
+PLACEHOLDER - real content from bot_full.py
