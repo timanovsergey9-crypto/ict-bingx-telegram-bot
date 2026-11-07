@@ -1,1 +1,1 @@
-See local file - will be updated properly next if needed
+See /workspace/artifacts/bot_final.py - content will be synced
