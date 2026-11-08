@@ -47,7 +47,7 @@ jobs:
           HTF: 4h
           LTF: 15m
           MARKET_TYPE: swap
-          TOP_N: 20
+          TOP_N: 100
           MIN_RR: 2.0
           MAX_SIGNALS_PER_DAY: 2
           BTC_FILTER: "1"
