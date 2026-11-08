@@ -1,1 +1,3 @@
-See /tmp/bot_compact.py for full content
+#!/usr/bin/env python3
+import os
+print('Full bot will be here')
