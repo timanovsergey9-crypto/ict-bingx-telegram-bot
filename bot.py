@@ -1,1 +1,1 @@
-See local bot_full_final.py - full version uploaded
+PLACEHOLDER_FULL
