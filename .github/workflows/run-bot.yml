@@ -3,13 +3,17 @@ name: Run ICT Bot
 on:
   workflow_dispatch:
   schedule:
-    # Перезапуск каждые 5 часов — бот работает почти бесперерывно
-    - cron: "0 */5 * * *"
+    # Каждые 4 часа — почти непрерывная работа
+    - cron: "5 */4 * * *"
+
+concurrency:
+  group: ict-bot
+  cancel-in-progress: true   # новый запуск убивает старый, без дублей
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 310  # чуть больше 5 часов, чтобы новый запуск успевал стартовать
+    timeout-minutes: 245     # ~4 часа + запас
 
     steps:
       - name: Checkout
@@ -25,8 +29,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Check secrets
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python bot.py
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "ERROR: Secrets TELEGRAM_TOKEN and CHAT_ID must be set in repo Settings → Secrets"
+            exit 1
+          fi
+          echo "Secrets OK"
+
+      - name: Run ICT bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          HTF: 4h
+          LTF: 15m
+          MARKET_TYPE: swap
+          TOP_N: 20
+          MIN_RR: 2.0
+          MAX_SIGNALS_PER_DAY: 2
+          BTC_FILTER: "1"
+          KILL_ZONES: "London,New York"
+        run: |
+          echo "Starting ICT bot at $(date -u)"
+          python bot.py
