@@ -3,12 +3,13 @@ name: Run ICT Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"
+    # Перезапуск каждые 5 часов — бот работает почти бесперерывно
+    - cron: "0 */5 * * *"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 310  # чуть больше 5 часов, чтобы новый запуск успевал стартовать
 
     steps:
       - name: Checkout
