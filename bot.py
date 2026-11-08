@@ -3,7 +3,6 @@
 ICT BingX Telegram Bot - Test version for GitHub Actions
 """
 import os
-import time
 import logging
 import asyncio
 from datetime import datetime, timezone, timedelta
@@ -53,25 +52,41 @@ async def send_message(bot, text):
 
 def main():
     bot = Bot(token=TELEGRAM_TOKEN)
-    logger.info("ICT Bot started (GitHub Actions test)")
+    logger.info("ICT Bot started")
 
     async def run():
         last_alert = None
+        last_active_kz = None
+
         while True:
             try:
+                # Предупреждение за 12 минут до Kill Zone
                 kz_info = next_kill_zone_info()
                 if kz_info and last_alert != kz_info["name"]:
-                    await send_message(bot, f"⏰ Kill Zone скоро\nЧерез ~{kz_info['minutes']} мин откроется <b>{kz_info['name']}</b>\nВремя: <b>{kz_info['opens_at_msk']}</b>")
+                    await send_message(
+                        bot,
+                        f"⏰ Kill Zone скоро\n"
+                        f"Через ~{kz_info['minutes']} мин откроется <b>{kz_info['name']}</b>\n"
+                        f"Время: <b>{kz_info['opens_at_msk']}</b>"
+                    )
                     last_alert = kz_info["name"]
 
+                # Сообщение о активной Kill Zone — только один раз
                 kz = is_kill_zone()
-                if kz:
-                    await send_message(bot, f"🟢 Сейчас активна Kill Zone: <b>{kz}</b>\nБот сканирует рынок...")
-                    logger.info(f"In Kill Zone: {kz}")
-                else:
+                if kz and kz != last_active_kz:
+                    await send_message(
+                        bot,
+                        f"🟢 Сейчас активна Kill Zone: <b>{kz}</b>\n"
+                        f"Бот сканирует рынок..."
+                    )
+                    logger.info(f"Entered Kill Zone: {kz}")
+                    last_active_kz = kz
+                elif not kz:
+                    last_active_kz = None
                     logger.info("Outside Kill Zone")
 
                 await asyncio.sleep(60)
+
             except Exception as e:
                 logger.error(e)
                 await asyncio.sleep(30)
