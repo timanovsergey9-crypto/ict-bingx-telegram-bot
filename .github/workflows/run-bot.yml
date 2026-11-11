@@ -10,6 +10,9 @@ concurrency:
   group: ict-bot
   cancel-in-progress: true   # новый запуск убивает старый, без дублей
 
+permissions:
+  contents: write            # нужно, чтобы сохранять статистику в ветку bot-data
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -40,10 +43,24 @@ jobs:
           fi
           echo "Secrets OK"
 
+      - name: Restore bot data
+        run: |
+          mkdir -p data
+          if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
+            git fetch --depth=1 origin bot-data
+            if git show FETCH_HEAD:trades.json > /tmp/trades.json 2>/dev/null; then
+              mv /tmp/trades.json data/trades.json
+              echo "Данные бота восстановлены"
+            fi
+          else
+            echo "Сохранённых данных ещё нет — старт с нуля"
+          fi
+
       - name: Run ICT bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
           HTF: 4h
           LTF: 15m
           MARKET_TYPE: swap
@@ -54,4 +71,16 @@ jobs:
           KILL_ZONES: "London,New York"
         run: |
           echo "Starting ICT bot at $(date -u)"
-          python bot.py
+          # раз в 15 минут сохраняем статистику в фоне
+          bash .github/scripts/save_data.sh --loop &
+          # бот сам завершается за ~5 минут до конца окна, чтобы успеть сохраниться
+          timeout 14100 python bot.py
+          rc=$?
+          if [ "$rc" -eq 124 ]; then exit 0; fi
+          exit "$rc"
+
+      - name: Save bot data
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/save_data.sh
