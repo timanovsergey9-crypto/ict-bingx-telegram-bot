@@ -65,7 +65,10 @@ TOP_N = _i("TOP_N", 100)
 MIN_QUOTE_VOLUME = _f("MIN_QUOTE_VOLUME", 5_000_000)
 MIN_RR = _f("MIN_RR", 2.0)
 MIN_QUALITY = _f("MIN_QUALITY", 6.5)                  # порог качества сигнала (0-10)
-MAX_SIGNALS_PER_DAY = _i("MAX_SIGNALS_PER_DAY", 4)
+MAX_SIGNALS_PER_DAY = _i("MAX_SIGNALS_PER_DAY", 4)     # 0 или меньше = без лимита
+MAX_OPEN_TRADES = _i("MAX_OPEN_TRADES", 6)            # макс. одновременно открытых сетапов (0 = без лимита)
+MAX_PER_DIRECTION = _i("MAX_PER_DIRECTION", 3)        # макс. открытых в одну сторону (альты коррелируют)
+REQUEST_TIMEOUT_S = _i("REQUEST_TIMEOUT_S", 90)       # таймаут анализа одной пары
 COOLDOWN_H = _f("COOLDOWN_H", 6)
 BTC_FILTER = os.getenv("BTC_FILTER", "1") == "1"
 ENABLED_KZ = [z.strip() for z in os.getenv("KILL_ZONES", "London,New York").split(",") if z.strip()]
@@ -596,7 +599,7 @@ STABLES = {"USDC", "FDUSD", "TUSD", "DAI", "USDE", "BUSD", "USDP", "PYUSD", "USD
 def make_exchange():
     import ccxt
 
-    return ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": MARKET_TYPE}})
+    return ccxt.bingx({"enableRateLimit": True, "timeout": 15000, "options": {"defaultType": MARKET_TYPE}})
 
 
 def drop_unclosed(df: pd.DataFrame, tf: str, now: Optional[datetime] = None) -> pd.DataFrame:
@@ -608,8 +611,21 @@ def drop_unclosed(df: pd.DataFrame, tf: str, now: Optional[datetime] = None) -> 
     return df
 
 
+def with_retry(fn: Callable, *args, attempts: int = 3, **kwargs):
+    """Повторяет сетевой вызов с паузой 1с, 2с, ... (лимиты биржи, обрывы связи)."""
+    import time
+
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            if i == attempts - 1:
+                raise
+            time.sleep(2 ** i)
+
+
 def fetch_frame(ex, symbol: str, tf: str, limit: int) -> pd.DataFrame:
-    raw = ex.fetch_ohlcv(symbol, tf, limit=limit)
+    raw = with_retry(ex.fetch_ohlcv, symbol, tf, limit=limit)
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.set_index("ts").astype(float)
@@ -707,6 +723,17 @@ class TradeStore:
                 if ms(now) - t["created_ms"] < COOLDOWN_H * 3600 * 1000:
                     return True
         return False
+
+    def open_blocked(self, direction: str) -> bool:
+        """Достигнут ли лимит одновременно открытых сетапов (общий или по направлению)."""
+        open_ = [t for t in self.trades if t["status"] in ("pending", "active")]
+        if MAX_OPEN_TRADES > 0 and len(open_) >= MAX_OPEN_TRADES:
+            return True
+        same = sum(1 for t in open_ if t["direction"] == direction)
+        return MAX_PER_DIRECTION > 0 and same >= MAX_PER_DIRECTION
+
+    def daily_limit_hit(self, now: datetime) -> bool:
+        return MAX_SIGNALS_PER_DAY > 0 and self.signals_today(now) >= MAX_SIGNALS_PER_DAY
 
     def grade_winrate(self, grade: str) -> Optional[Tuple[int, int]]:
         """(wins, decided) по закрытым сделкам данного грейда."""
@@ -955,7 +982,9 @@ async def cmd_status(update, context):
     txt += f"Kill Zone: {kz}\n" if kz else "Сейчас вне Kill Zone — скан приостановлен\n"
     if nxt and not kz:
         txt += f"Следующая: {nxt[0]} в {fmt_msk(nxt[1])}\n"
-    txt += f"Сигналов сегодня: {store.signals_today(now)}/{MAX_SIGNALS_PER_DAY}\nПороги: RR≥{MIN_RR}, quality≥{MIN_QUALITY}"
+    limit = MAX_SIGNALS_PER_DAY if MAX_SIGNALS_PER_DAY > 0 else "∞"
+    opened = sum(1 for t in store.trades if t["status"] in ("pending", "active"))
+    txt += f"Сигналов сегодня: {store.signals_today(now)}/{limit}\nОткрытых сетапов: {opened}\nПороги: RR≥{MIN_RR}, quality≥{MIN_QUALITY}"
     await update.message.reply_text(txt)
 
 
@@ -986,7 +1015,10 @@ async def scan_market(ex) -> List[Dict]:
     async def _one(sym: str) -> Optional[Dict]:
         async with sem:
             try:
-                return await asyncio.to_thread(analyze_symbol, ex, sym, btc_bias)
+                return await asyncio.wait_for(asyncio.to_thread(analyze_symbol, ex, sym, btc_bias), REQUEST_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning("%s: таймаут анализа", sym)
+                return None
             except Exception as e:  # noqa: BLE001
                 logger.warning("%s: %s", sym, e)
                 return None
@@ -1005,14 +1037,17 @@ async def scanner_loop(bot, ex, store: TradeStore) -> None:
 
             if not kz_at(utcnow()):
                 continue  # вне Kill Zone сигналов быть не может — экономим запросы к бирже
-            if store.signals_today(utcnow()) >= MAX_SIGNALS_PER_DAY:
+            if store.daily_limit_hit(utcnow()):
                 logger.info("Достигнут дневной лимит сигналов")
                 continue
 
             for sig in await scan_market(ex):
-                if store.signals_today(utcnow()) >= MAX_SIGNALS_PER_DAY:
+                if store.daily_limit_hit(utcnow()):
                     break
                 if store.blocked(sig, utcnow()):
+                    continue
+                if store.open_blocked(sig["direction"]):
+                    logger.info("Пропуск %s %s: лимит открытых сетапов", sig["symbol"], sig["direction"])
                     continue
                 await send_signal(bot, sig, store)
                 store.add(make_trade(sig, utcnow()))
@@ -1034,7 +1069,7 @@ EVENT_TEXT = {
 async def monitor_trades(bot, ex, store: TradeStore) -> None:
     for t in [x for x in store.trades if x["status"] in ("pending", "active")]:
         try:
-            raw = await asyncio.to_thread(ex.fetch_ohlcv, t["symbol"], "1m", t["checked_ms"], 1000)
+            raw = await asyncio.to_thread(with_retry, ex.fetch_ohlcv, t["symbol"], "1m", t["checked_ms"], 1000)
             now_ms = ms(utcnow())
             candles = [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])) for r in raw if r[0] + 60_000 <= now_ms]
             events = evaluate_trade(t, candles)
@@ -1082,7 +1117,7 @@ async def run_bot() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("ICT bot v3 запущен: %s, HTF %s / LTF %s, quality>=%s", MARKET_TYPE, HTF, LTF, MIN_QUALITY)
     try:
-        await app.bot.send_message(chat_id=CHAT_ID, text="✅ ICT бот v3 запущен. Команды: /status /stats /open")
+        await app.bot.send_message(chat_id=CHAT_ID, text="✅ ICT бот v3 запущен. Команды: /status /stats /open", disable_notification=True)
     except Exception:  # noqa: BLE001
         logger.exception("не удалось отправить стартовое сообщение — проверьте CHAT_ID и что вы нажали /start у бота")
     try:
@@ -1129,18 +1164,40 @@ def selftest() -> int:
     evaluate_trade(t, [(60_000, 99, 100.2, 98.5, 99), (120_000, 99, 99, 95.5, 96)])
     check("SHORT: вход затем TP = win +2R", t["status"] == "win" and abs(t["r"] - 2.0) < 1e-6)
 
+    # 2b) лимиты: открытых сетапов и по направлению; 0 = без дневного лимита
+    global MAX_SIGNALS_PER_DAY
+    st = TradeStore("/tmp/_selftest_trades.json")
+    st.trades = [{"direction": "LONG", "status": "pending", "created_ms": ms(utcnow()), "key": "k", "symbol": "A"} for _ in range(MAX_PER_DIRECTION)]
+    check("лимит по направлению: LONG заблокирован, SHORT свободен", st.open_blocked("LONG") and not st.open_blocked("SHORT"))
+    saved, MAX_SIGNALS_PER_DAY = MAX_SIGNALS_PER_DAY, 0
+    check("MAX_SIGNALS_PER_DAY=0 означает без лимита", not st.daily_limit_hit(utcnow()))
+    MAX_SIGNALS_PER_DAY = saved
+
+    # 2c) with_retry: повторяет и в итоге возвращает результат
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("temp")
+        return "ok"
+
+    check("with_retry переживает временную ошибку", with_retry(flaky) == "ok" and calls["n"] == 2)
+
     # 3) прогон анализатора на случайных данных: нет исключений, сигнал (если есть) валиден
-    rng = np.random.default_rng(7)
     n_sig = 0
     for seed in range(40):
         rng = np.random.default_rng(seed)
+
         def series(n, freq, step):
             r = rng.normal(0, step, n).cumsum() + 100
             ix = pd.date_range("2026-03-01", periods=n, freq=freq, tz="UTC")
-            hi = r + np.abs(rng.normal(0, step, n)); lo = r - np.abs(rng.normal(0, step, n))
+            hi = r + np.abs(rng.normal(0, step, n))
+            lo = r - np.abs(rng.normal(0, step, n))
             op = np.r_[r[0], r[:-1]]
             return pd.DataFrame({"open": op, "high": np.maximum.reduce([hi, op, r]), "low": np.minimum.reduce([lo, op, r]),
                                  "close": r, "volume": rng.uniform(50, 150, n) * (1 + 3 * (rng.random(n) > 0.9))}, index=ix)
+
         htf, ltf = series(250, "4h", 1.2), series(300, "15min", 0.35)
         sig = analyze_frames("TEST/USDT", htf, ltf, ltf.index[-1].to_pydatetime(), None, True)
         if sig:
