@@ -72,16 +72,19 @@ jobs:
           BTC_FILTER: "1"
           KILL_ZONES: "London,New York"
         run: |
+          set +e
           echo "Starting ICT bot at $(date -u)"
           # раз в 15 минут сохраняем статистику в фоне
           bash .github/scripts/save_data.sh --loop &
           # бот сам завершается за ~5 минут до конца окна, чтобы успеть сохраниться
-          rc=0
-          timeout 14100 python bot.py || rc=$?
+          timeout 14100 python bot.py
+          rc=$?
+          set -e
           if [ "$rc" -eq 124 ]; then
-            echo "ICT run window ended normally"
+            echo "ICT run window ended normally (timeout)"
             exit 0
           fi
+          echo "Bot exited with code $rc"
           exit "$rc"
 
       - name: Save bot data
