@@ -1,0 +1,84 @@
+name: Run ICT Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Aligned with 4h candle closes (00/04/08/12/16/20 UTC) plus 5 minutes.
+    - cron: "5 */4 * * *"
+
+concurrency:
+  group: ict-bot
+  cancel-in-progress: false   # one-shot is short; do not kill a running scan
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Offline self-test
+        run: python bot.py --selftest
+
+      - name: Check secrets
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "ERROR: Secrets TELEGRAM_TOKEN and CHAT_ID must be set in repo Settings → Secrets"
+            exit 1
+          fi
+          echo "Secrets OK"
+
+      - name: Restore bot data
+        run: |
+          mkdir -p data
+          if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
+            git fetch --depth=1 origin bot-data
+            if git show FETCH_HEAD:plus_one_state.json > /tmp/plus_one_state.json 2>/dev/null; then
+              mv /tmp/plus_one_state.json data/plus_one_state.json
+              echo "Plus One state restored"
+            else
+              echo "No plus_one_state.json in bot-data yet"
+            fi
+          else
+            echo "No bot-data branch yet — start fresh (duplicates possible only on manual re-runs)"
+          fi
+
+      - name: Run Plus One scan
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Starting Plus One scan at $(date -u)"
+          python bot.py --scan-once
+
+      - name: Save bot data
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f .github/scripts/save_data.sh ]; then
+            bash .github/scripts/save_data.sh
+          else
+            echo "no save_data.sh, skip"
+          fi
