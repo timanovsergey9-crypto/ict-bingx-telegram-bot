@@ -1,6 +1,8 @@
 name: Run ICT Bot
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
   schedule:
     # Каждые 4 часа — почти непрерывная работа
@@ -74,9 +76,12 @@ jobs:
           # раз в 15 минут сохраняем статистику в фоне
           bash .github/scripts/save_data.sh --loop &
           # бот сам завершается за ~5 минут до конца окна, чтобы успеть сохраниться
-          timeout 14100 python bot.py
-          rc=$?
-          if [ "$rc" -eq 124 ]; then exit 0; fi
+          rc=0
+          timeout 14100 python bot.py || rc=$?
+          if [ "$rc" -eq 124 ]; then
+            echo "ICT run window ended normally"
+            exit 0
+          fi
           exit "$rc"
 
       - name: Save bot data
