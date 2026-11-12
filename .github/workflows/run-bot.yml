@@ -5,20 +5,20 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    # Каждые 4 часа — почти непрерывная работа
+    # Aligned with 4h candle closes (00/04/08/12/16/20 UTC) plus 5 minutes.
     - cron: "5 */4 * * *"
 
 concurrency:
   group: ict-bot
-  cancel-in-progress: true   # новый запуск убивает старый, без дублей
+  cancel-in-progress: false   # one-shot is short; do not kill a running scan
 
 permissions:
-  contents: write            # нужно, чтобы сохранять статистику в ветку bot-data
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 245     # ~4 часа + запас
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -33,6 +33,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Offline self-test
+        run: python bot.py --selftest
 
       - name: Check secrets
         env:
@@ -50,45 +53,32 @@ jobs:
           mkdir -p data
           if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
             git fetch --depth=1 origin bot-data
-            if git show FETCH_HEAD:trades.json > /tmp/trades.json 2>/dev/null; then
-              mv /tmp/trades.json data/trades.json
-              echo "Данные бота восстановлены"
+            if git show FETCH_HEAD:plus_one_state.json > /tmp/plus_one_state.json 2>/dev/null; then
+              mv /tmp/plus_one_state.json data/plus_one_state.json
+              echo "Plus One state restored"
+            else
+              echo "No plus_one_state.json in bot-data yet"
             fi
           else
-            echo "Сохранённых данных ещё нет — старт с нуля"
+            echo "No bot-data branch yet — start fresh (duplicates possible only on manual re-runs)"
           fi
 
-      - name: Run ICT bot
+      - name: Run Plus One scan
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GH_TOKEN: ${{ github.token }}
-          HTF: 4h
-          LTF: 15m
-          MARKET_TYPE: swap
-          TOP_N: 100
-          MIN_RR: 2.0
-          MAX_SIGNALS_PER_DAY: 2
-          BTC_FILTER: "1"
-          KILL_ZONES: "London,New York"
         run: |
-          set +e
-          echo "Starting ICT bot at $(date -u)"
-          # раз в 15 минут сохраняем статистику в фоне
-          bash .github/scripts/save_data.sh --loop &
-          # бот сам завершается за ~5 минут до конца окна, чтобы успеть сохраниться
-          timeout 14100 python bot.py
-          rc=$?
-          set -e
-          if [ "$rc" -eq 124 ]; then
-            echo "ICT run window ended normally (timeout)"
-            exit 0
-          fi
-          echo "Bot exited with code $rc"
-          exit "$rc"
+          echo "Starting Plus One scan at $(date -u)"
+          python bot.py --scan-once
 
       - name: Save bot data
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/save_data.sh
+        run: |
+          if [ -f .github/scripts/save_data.sh ]; then
+            bash .github/scripts/save_data.sh
+          else
+            echo "no save_data.sh, skip"
+          fi
