@@ -11,6 +11,9 @@ the only source of Telegram credentials.
   python bot.py --replay 14         bar-by-bar last N days + 2R/8-bar outcomes
   python bot.py                     same as --scan-once (one-shot, not a 4h loop)
 
+This bot runs Plus One on the **4h timeframe only**. The 1d sleeve lives
+on bingx-signal-bot (TIMEFRAMES=4h in settings.env; same default in code).
+
 Kill zones are intentionally NOT applied: session filters failed the DEV gates
 in the validated research, and they were the main reason this bot stayed silent.
 """
@@ -71,6 +74,22 @@ def _i(name: str, default: int) -> int:
 MIN_QV = _f("MIN_QUOTE_VOLUME", 5_000_000.0)
 TOP_N = _i("TOP_N", 0)
 MAX_CONCURRENT = _i("MAX_CONCURRENT", 5)
+
+
+def parse_timeframes(raw: str | None, default: str = "4h") -> list[str]:
+    """Comma-separated timeframes. This bot's default is 4h only."""
+    allowed = ("4h", "1d")
+    src = (raw if raw is not None and str(raw).strip() else default)
+    out: list[str] = []
+    for part in src.replace(";", ",").split(","):
+        part = part.strip().lower()
+        if part in allowed and part not in out:
+            out.append(part)
+    return out or [default]
+
+
+# Default matches settings.env: 4h only (1d is on bingx-signal-bot).
+TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES"), "4h")
 
 
 def selftest() -> int:
@@ -164,6 +183,10 @@ def selftest() -> int:
         check("no AI signature", "AI" not in msg and "бот сгенерир" not in msg.lower())
         check("has caveat", "Не финансовый совет" in msg)
 
+    check("parse default is 4h only", parse_timeframes(None, "4h") == ["4h"])
+    check("this bot TIMEFRAMES is 4h only", TIMEFRAMES == ["4h"], str(TIMEFRAMES))
+    check("1d not in this bot TFs", "1d" not in TIMEFRAMES)
+
     print("ИТОГ: " + ("ВСЁ ОК" if ok else "ЕСТЬ ОШИБКИ"))
     return 0 if ok else 1
 
@@ -213,8 +236,11 @@ def run_scan(dry_run: bool, send: bool) -> int:
 
     MSK = ZoneInfo("Europe/Moscow")
     now = datetime.now(MSK)
-    tfs = ["4h", "1d"]
-    print(f"Plus One scan  {now.strftime('%Y-%m-%d %H:%M:%S %Z')}  min_qv=${MIN_QV:,.0f}  dry_run={dry_run}")
+    tfs = list(TIMEFRAMES)
+    print(
+        f"Plus One scan  {now.strftime('%Y-%m-%d %H:%M:%S %Z')}  "
+        f"timeframes={','.join(tfs)}  min_qv=${MIN_QV:,.0f}  dry_run={dry_run}"
+    )
     try:
         uni, rejected, n_contracts = get_liquid_universe(MIN_QV, TOP_N)
     except Exception as e:
@@ -229,8 +255,9 @@ def run_scan(dry_run: bool, send: bool) -> int:
     state = {} if dry_run else load_state()
     results = []
     errors = []
-    funnel = {"scanned_4h": 0, "scanned_1d": 0, "setups_4h": 0, "setups_1d": 0,
-              "new": 0, "dupes": 0, "sent": 0, "send_fail": 0, "kline_err": 0}
+    funnel = {f"scanned_{tf}": 0 for tf in tfs}
+    funnel.update({f"setups_{tf}": 0 for tf in tfs})
+    funnel.update({"new": 0, "dupes": 0, "sent": 0, "send_fail": 0, "kline_err": 0})
 
     for rec in uni:
         rec = dict(rec)
@@ -257,9 +284,10 @@ def run_scan(dry_run: bool, send: bool) -> int:
                 errors.append({"symbol": rec["plain"], "tf": tf, "error": f"{type(e).__name__}: {e}"})
                 time.sleep(0.2)
 
+    scanned_s = " ".join(f"{tf}={funnel[f'scanned_{tf}']}" for tf in tfs)
+    setups_s = " ".join(f"{tf}={funnel[f'setups_{tf}']}" for tf in tfs)
     print(
-        f"FUNNEL scanned 4h={funnel['scanned_4h']} 1d={funnel['scanned_1d']}  "
-        f"setups 4h={funnel['setups_4h']} 1d={funnel['setups_1d']}  kline_err={funnel['kline_err']}"
+        f"FUNNEL scanned {scanned_s}  setups {setups_s}  kline_err={funnel['kline_err']}"
     )
     if errors:
         for e in errors[:15]:
@@ -291,7 +319,7 @@ def run_scan(dry_run: bool, send: bool) -> int:
         # Daily Day-2 lasts 24h; only announce in the first 4h so a late cron
         # does not push a stale 1d stop 20 hours in.
         if r["tf"] == "1d" and now_utc > vf + _pd.Timedelta(hours=4):
-            print("  1d setup is more than 4h into Day-2, skip (stale)")
+            print("  1d setup is more than 4 hours into Day-2, skip (stale)")
             continue
         key = f"{r['plain']}|{r['tf']}|{s['setup_time']}|{s['direction']}"
         if key in state:
@@ -341,7 +369,11 @@ def run_replay(days: int) -> int:
 
     now = pd.Timestamp.now(tz="UTC")
     since = now - pd.Timedelta(days=days)
-    print(f"Plus One REPLAY last {days} days  since {since}  min_qv=${MIN_QV:,.0f}  cost={COST}/side")
+    tfs = list(TIMEFRAMES)
+    print(
+        f"Plus One REPLAY last {days} days  since {since}  "
+        f"timeframes={','.join(tfs)}  min_qv=${MIN_QV:,.0f}  cost={COST}/side"
+    )
     uni, rejected, n_contracts = get_liquid_universe(MIN_QV, TOP_N)
     print(f"FUNNEL universe liquid={len(uni)} (from {n_contracts}, qv-reject={rejected['qv']})")
 
@@ -349,7 +381,8 @@ def run_replay(days: int) -> int:
     errors = 0
     scanned = 0
     for rec in uni:
-        for tf, limit in (("4h", 200), ("1d", 200)):
+        for tf in tfs:
+            limit = 400 if tf == "4h" else 200
             try:
                 df = fetch_klines(rec["bingx"], tf, limit=limit)
                 found = replay_frame(df, tf, since=since, now=now)
@@ -379,7 +412,8 @@ def run_replay(days: int) -> int:
     cal = pd.date_range(since.floor("D"), now.floor("D"), freq="D", tz="UTC")
     covered = sum(1 for d in cal if str(d.date()) in by_day)
     print(f"FUNNEL scanned_frames={scanned} errors={errors}")
-    print(f"SETUPS: {len(all_setups)}  4h={by_tf['4h']}  1d={by_tf['1d']}")
+    tf_counts = "  ".join(f"{tf}={by_tf[tf]}" for tf in tfs)
+    print(f"SETUPS: {len(all_setups)}  {tf_counts}")
     print(f"DAYS with >=1 setup: {covered}/{len(cal)} ({100*covered/max(len(cal),1):.1f}%)  t/day={len(all_setups)/max(len(cal),1):.2f}")
     print(f"OUTCOMES filled={len(closed)} unfilled={len(unfilled)} still_open={len(open_tr)}")
     if closed:

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Turtle Soup Plus One — frozen Raschke & Connors (*Street Smarts*, ch. 5) rules.
 
-Validated on liquid BingX USDT-M perps (24h quote volume >= $5M):
-  4h primary, 1d secondary. Exit 2R or at the close of the 8th bar.
-  Holdout 2026-02-12..2026-11-11, 31 coins: +0.181R/trade, PF 1.33, 25/31,
+Validated on liquid BingX USDT-M perps (24h quote volume >= $5M).
+  This bot scans the **4h timeframe only** (1d is on bingx-signal-bot).
+  Exit 2R or at the close of the 8th bar.
+  Holdout 2026-02-12..2026-11-11, 31 coins, 4h: +0.181R/trade, PF 1.33, 25/31,
   4.24 fills/day, a setup on 91.6% of calendar days.
   Costs 0.07%/side, next-bar fill only if price trades through.
   Classic Turtle Soup (ch. 4, no close confirmation) is net-negative on 4h.
