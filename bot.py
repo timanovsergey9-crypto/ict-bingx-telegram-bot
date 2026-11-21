@@ -9,7 +9,12 @@ the only source of Telegram credentials.
   python bot.py --dry-run           live scan, print only, never Telegram
   python bot.py --scan-once         live scan; Telegram if tokens are set
   python bot.py --replay 14         bar-by-bar last N days + 2R/8-bar outcomes
+  python bot.py --stats             send the signal-journal statistics to Telegram now
   python bot.py                     same as --scan-once (one-shot, not a 4h loop)
+
+Journal: every sent signal is stored in data/plus_one_4h.json and resolved later with the
+same fill/stop/2R/8-bar rules as the backtest (tracker.py). GitHub Actions restores data/
+from the bot-data branch before the run and commits it back after (.github/scripts/persist.sh).
 
 This bot runs Plus One on the **4h timeframe only**. The 1d sleeve lives
 on bingx-signal-bot (TIMEFRAMES=4h in settings.env; same default in code).
@@ -28,6 +33,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from tracker import Journal, new_trade, resolve_plus_one, send_daily_summary, stats_text
 
 PROTECTED = {"TELEGRAM_TOKEN", "CHAT_ID", "BOT_TOKEN"}
 STATE_PATH = Path(__file__).resolve().parent / "data" / "plus_one_state.json"
@@ -74,6 +81,9 @@ def _i(name: str, default: int) -> int:
 MIN_QV = _f("MIN_QUOTE_VOLUME", 5_000_000.0)
 TOP_N = _i("TOP_N", 0)
 MAX_CONCURRENT = _i("MAX_CONCURRENT", 5)
+SUMMARY_HOUR_UTC = _i("SUMMARY_HOUR_UTC", 6)   # во сколько (UTC) слать суточную сводку
+JOURNAL_NAME = "plus_one_4h"
+STATS_TITLE = "Plus One 4h: статистика сигналов"
 
 
 def parse_timeframes(raw: str | None, default: str = "4h") -> list[str]:
@@ -175,6 +185,41 @@ def selftest() -> int:
         if out and out.get("filled"):
             check("net R after costs is positive on TP", out["net_r"] > 1.5, f"net_r={out['net_r']:.3f}")
 
+    # журнал + трекер исходов (то, что отвечает за сохранение статистики)
+    if sig:
+        import tempfile
+        from plus_one import tf_step
+
+        rec0 = {"plain": "TESTUSDT", "bingx": "TEST-USDT"}
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal("selftest", d)
+            s2 = annotate_setup(dfe, plus_one_day1(dfe, t=LOOKBACK), "4h")
+            j.add(make_plus_one_trade(rec0, s2, "k1"))
+            j2 = Journal("selftest", d).load()
+            check("журнал пишется на диск и читается заново", len(j2.trades) == 1 and j2.has_key("k1"))
+            msgs: list = []
+            n = resolve_plus_one(j2, lambda sym, tf, limit: dfe, simulate_fill_and_exit, drop_unclosed,
+                                 tf_step, lambda m: msgs.append(m) or True)
+            tr = j2.trades[0]
+            check("трекер закрыл сделку по TP с R>1.5", n == 1 and tr["status"] == "tp" and tr["net_r"] > 1.5, str(tr.get("status")))
+            check("после закрытия ушло уведомление", len(msgs) == 1 and "цель" in msgs[0])
+            j3 = Journal("selftest", d).load()
+            check("результат сделки сохранён на диск", j3.trades[0]["status"] == "tp")
+            txt = stats_text(j3.trades, "тест")
+            check("статистика видит закрытую сделку", "TP 1" in txt and "Winrate" in txt)
+
+            un = list(rows) + [(80, 85, 78, 82), (80, 85, 78, 82)]
+            dfu = make_df(un)
+            ju = Journal("selftest_u", d)
+            ju.add(make_plus_one_trade(rec0, annotate_setup(dfu, plus_one_day1(dfu, t=LOOKBACK), "4h"), "k2"))
+            resolve_plus_one(ju, lambda sym, tf, limit: dfu, simulate_fill_and_exit, drop_unclosed, tf_step, lambda m: True)
+            check("вход не сработал -> unfilled (R не считается)", ju.trades[0]["status"] == "unfilled" and ju.trades[0]["net_r"] is None)
+
+            bad = Journal("selftest_bad", d)
+            bad.path.write_text("{ битый json", encoding="utf-8")
+            bad.load()
+            check("битый файл не роняет бота и не стирается", bad.trades == [] and bad.path.with_suffix(".corrupt").exists())
+
     # message has no AI/bot signature and contains the levels
     if sig:
         rec = {"symbol": "BTCUSDT", "price_prec": 1, "qv": 1e9, "in_backtest": True}
@@ -205,6 +250,14 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
 
 
+def make_plus_one_trade(rec: dict, setup: dict, key: str) -> dict:
+    return new_trade(
+        key=key, symbol=rec["plain"], direction=setup["direction"], entry=setup["entry"],
+        sl=setup["sl"], tp=setup["tp"], tf=setup["tf"],
+        extra={"bingx": rec["bingx"], "setup": setup, "bot": "plus_one"},
+    )
+
+
 def telegram_send(text: str) -> bool:
     token = os.getenv("TELEGRAM_TOKEN", "").strip() or os.getenv("BOT_TOKEN", "").strip()
     chat = os.getenv("CHAT_ID", "").strip()
@@ -228,7 +281,7 @@ def telegram_send(text: str) -> bool:
 def run_scan(dry_run: bool, send: bool) -> int:
     from plus_one import (
         get_liquid_universe, fetch_klines, scan_frame, signal_text,
-        liquidity_tags, fmt_msk, BACKTESTED,
+        liquidity_tags, fmt_msk, BACKTESTED, simulate_fill_and_exit, drop_unclosed, tf_step,
     )
     from plus_one import MIN_QV_DEFAULT  # noqa: F401
     from datetime import timezone as tz
@@ -241,6 +294,13 @@ def run_scan(dry_run: bool, send: bool) -> int:
         f"Plus One scan  {now.strftime('%Y-%m-%d %H:%M:%S %Z')}  "
         f"timeframes={','.join(tfs)}  min_qv=${MIN_QV:,.0f}  dry_run={dry_run}"
     )
+    journal = None
+    if not dry_run:
+        journal = Journal(JOURNAL_NAME).load()
+        if send:
+            changed = resolve_plus_one(journal, fetch_klines, simulate_fill_and_exit, drop_unclosed,
+                                       tf_step, telegram_send)
+            print(f"JOURNAL resolved={changed} open={len(journal.open_trades())} total={len(journal.trades)}")
     try:
         uni, rejected, n_contracts = get_liquid_universe(MIN_QV, TOP_N)
     except Exception as e:
@@ -252,7 +312,7 @@ def run_scan(dry_run: bool, send: bool) -> int:
         f"liquid={len(uni)}"
     )
 
-    state = {} if dry_run else load_state()
+    state = {} if dry_run else load_state()   # старый файл дедупа, только для чтения
     results = []
     errors = []
     funnel = {f"scanned_{tf}": 0 for tf in tfs}
@@ -322,7 +382,7 @@ def run_scan(dry_run: bool, send: bool) -> int:
             print("  1d setup is more than 4 hours into Day-2, skip (stale)")
             continue
         key = f"{r['plain']}|{r['tf']}|{s['setup_time']}|{s['direction']}"
-        if key in state:
+        if key in state or (journal is not None and journal.has_key(key)):
             funnel["dupes"] += 1
             print(f"  dupe (already recorded), skip send")
             continue
@@ -336,6 +396,8 @@ def run_scan(dry_run: bool, send: bool) -> int:
             if telegram_send(text):
                 funnel["sent"] += 1
                 state[key] = {"t": now.isoformat(), "entry": s["entry"], "sl": s["sl"], "tp": s["tp"]}
+                if journal is not None:
+                    journal.add(make_plus_one_trade(r, s, key))   # сразу на диск
                 print("  sent to Telegram")
             else:
                 funnel["send_fail"] += 1
@@ -347,6 +409,13 @@ def run_scan(dry_run: bool, send: bool) -> int:
         state = {k: v for k, v in state.items() if str(v.get("t", "9999")) >= cutoff[:10] or True}
         save_state(state)
 
+    if journal is not None:
+        journal.save()
+        if send:
+            send_daily_summary(journal, telegram_send, SUMMARY_HOUR_UTC, STATS_TITLE)
+        done = [t for t in journal.trades if t["status"] in ("tp", "sl", "time")]
+        print(f"JOURNAL total={len(journal.trades)} open={len(journal.open_trades())} "
+              f"closed={len(done)} sumR={sum(t['net_r'] for t in done):+.2f}")
     print(
         f"FUNNEL new={funnel['new']} dupes={funnel['dupes']} "
         f"sent={funnel['sent']} send_fail={funnel['send_fail']}"
@@ -442,6 +511,19 @@ def run_replay(days: int) -> int:
     return 0
 
 
+def run_stats() -> int:
+    """Проверить исходы и прислать статистику в Telegram прямо сейчас."""
+    from plus_one import fetch_klines, simulate_fill_and_exit, drop_unclosed, tf_step
+
+    journal = Journal(JOURNAL_NAME).load()
+    resolve_plus_one(journal, fetch_klines, simulate_fill_and_exit, drop_unclosed, tf_step, telegram_send)
+    journal.save()
+    print(stats_text(journal.trades, STATS_TITLE))
+    if journal.trades:
+        send_daily_summary(journal, telegram_send, 0, STATS_TITLE, force=True)
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Turtle Soup Plus One scanner (BingX USDT-M)")
     p.add_argument("--selftest", action="store_true")
@@ -450,6 +532,7 @@ def main(argv=None) -> int:
                    help="Live scan, never send to Telegram")
     p.add_argument("--replay", type=int, default=0, metavar="DAYS",
                    help="Bar-by-bar replay over the last DAYS days with outcomes")
+    p.add_argument("--stats", action="store_true", help="Resolve open trades and send statistics now")
     p.add_argument("--min-qv", type=float, default=None)
     p.add_argument("--top-n", type=int, default=None)
     args = p.parse_args(argv)
@@ -462,6 +545,8 @@ def main(argv=None) -> int:
 
     if args.selftest:
         return selftest()
+    if args.stats:
+        return run_stats()
     if args.replay:
         return run_replay(args.replay)
     # default and --scan-once: one-shot live scan
