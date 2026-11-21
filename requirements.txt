@@ -2,3 +2,6 @@ pandas>=2.0
 numpy>=1.26
 requests>=2.31
 tzdata
+ccxt>=4.0
+matplotlib>=3.7
+python-telegram-bot>=20.7,<22
